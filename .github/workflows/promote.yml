@@ -1,5 +1,8 @@
 name: Promote
 
+# Show the build + target in the Actions runs list (inputs are available to run-name).
+run-name: "Promote ${{ inputs.build_id }} → ${{ inputs.target }}"
+
 # Promotes a stored build (button #2) to a later stage.
 # Pick a build_id + target; the target's GitHub Environment gates the run
 # (gate first), then placeholder tests run, then a placeholder deploy.

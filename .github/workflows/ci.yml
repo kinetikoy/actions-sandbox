@@ -77,6 +77,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Build ${BUILD_NUMBER} → ${TAG}"
 
+          # Surface the build number on the run page (one click from the runs list)
+          {
+            echo "## 🏗️ Build ${BUILD_NUMBER}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Build number | \`${BUILD_NUMBER}\` |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Release tag | \`${TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ---------------------------------------------------------------------------
   # jira-release-notes  (≈ GitLab jira-release-notes)
   # ---------------------------------------------------------------------------
