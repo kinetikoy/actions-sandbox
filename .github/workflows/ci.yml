@@ -281,4 +281,22 @@ jobs:
             android/app/build/reports/lint-results-prodRelease.xml
           retention-days: 7
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. DEPLOY (gated)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ---------------------------------------------------------------------------
+  # deploy-development  — calls the reusable deploy.yml after the debug build
+  # (button #1, in-run gate). The 'development' GitHub Environment pauses this
+  # as "Review deployments" until a reviewer approves, then it runs and goes
+  # green. Configure the environment + a required reviewer in
+  # repo Settings → Environments.
+  # ---------------------------------------------------------------------------
+  deploy-development:
+    name: Deploy (development)
+    needs: [test-and-build-debug]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: development
+    secrets: inherit
 
