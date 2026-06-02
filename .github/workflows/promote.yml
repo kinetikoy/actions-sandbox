@@ -1,0 +1,61 @@
+name: Promote
+
+# Promotes a stored build (button #2) to a later stage.
+# Pick a build_id + target; the target's GitHub Environment gates the run
+# (gate first), then placeholder tests run, then a placeholder deploy.
+# Resolves artifacts from the per-build Release that ci.yml published.
+# See specs/CI-DEPLOYMENT.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Build number to promote (e.g. 1059)
+        type: string
+        required: true
+      target:
+        description: Target stage
+        type: choice
+        required: true
+        options:
+          - internal
+          - pilot
+          - production
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.build_id }} → ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    # Gate first: the target stage's required reviewers must approve before
+    # any step runs. Create these environments in Settings → Environments.
+    environment: ${{ inputs.target }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve build artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          TAG="v0.0.${BUILD_ID}"   # sandbox tag scheme (real ci uses full version)
+          echo "Resolving Release $TAG for build $BUILD_ID"
+          mkdir -p dist
+          gh release download "$TAG" --dir dist
+          echo "Downloaded assets:"
+          ls -1 dist
+
+      - name: Run stage tests (placeholder)
+        env:
+          TARGET: ${{ inputs.target }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          echo "Running '$TARGET' promotion tests for build $BUILD_ID..."
+          echo "All tests passed ✅"
+
+      - name: Deploy (placeholder)
+        env:
+          TARGET: ${{ inputs.target }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          echo "Deploying build $BUILD_ID to '$TARGET' 👋 (placeholder — no real target yet)"
