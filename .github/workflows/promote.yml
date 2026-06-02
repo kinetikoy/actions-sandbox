@@ -1,12 +1,13 @@
 name: Promote
 
-# Show the build + target in the Actions runs list (inputs are available to run-name).
-run-name: "Promote ${{ inputs.build_id }} → ${{ inputs.target }}"
+# Show build + target (+ SKIP) in the Actions runs list.
+run-name: "Promote ${{ inputs.build_id }} → ${{ inputs.target }}${{ inputs.allow_skip && ' (SKIP)' || '' }}"
 
-# Promotes a stored build (button #2) to a later stage.
-# Pick a build_id + target; the target's GitHub Environment gates the run
-# (gate first), then placeholder tests run, then a placeholder deploy.
-# Resolves artifacts from the per-build Release that ci.yml published.
+# Promotes a stored build (button #2) to a later stage, enforcing order:
+#   internal → pilot → production
+# Order is enforced via per-stage marker assets on the build's GitHub Release.
+# A documented override (allow_skip + reason) can bypass ORDER only — never the
+# mandatory tests. The target's environment reviewers still gate every promotion.
 # See specs/CI-DEPLOYMENT.md.
 
 on:
@@ -24,41 +25,130 @@ on:
           - internal
           - pilot
           - production
+      allow_skip:
+        description: Bypass the predecessor-stage requirement (tests still run)
+        type: boolean
+        default: false
+      reason:
+        description: Why the skip is justified (required when allow_skip is set)
+        type: string
+        default: ''
 
 jobs:
-  promote:
-    name: Promote ${{ inputs.build_id }} → ${{ inputs.target }}
+  # ---------------------------------------------------------------------------
+  # preflight — fast ordering check, no environment/gate. Fails before any
+  # approver is involved if the predecessor stage hasn't been completed.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Preflight (ordering)
     runs-on: ubuntu-latest
-    # Gate first: the target stage's required reviewers must approve before
-    # any step runs. Create these environments in Settings → Environments.
-    environment: ${{ inputs.target }}
     permissions:
       contents: read
     steps:
-      - name: Resolve build artifacts
+      - name: Verify prerequisite stage
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           BUILD_ID: ${{ inputs.build_id }}
-        run: |
-          TAG="v0.0.${BUILD_ID}"   # sandbox tag scheme (real ci uses full version)
-          echo "Resolving Release $TAG for build $BUILD_ID"
-          mkdir -p dist
-          gh release download "$TAG" --dir dist
-          echo "Downloaded assets:"
-          ls -1 dist
-
-      - name: Run stage tests (placeholder)
-        env:
           TARGET: ${{ inputs.target }}
-          BUILD_ID: ${{ inputs.build_id }}
+          ALLOW_SKIP: ${{ inputs.allow_skip }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
         run: |
-          echo "Running '$TARGET' promotion tests for build $BUILD_ID..."
+          set -euo pipefail
+          TAG="v0.0.${BUILD_ID}"   # sandbox tag scheme (real ci uses full version)
+
+          # The build must actually exist as a published Release.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::No release $TAG (build $BUILD_ID) found — nothing to promote."
+            exit 1
+          fi
+
+          # Immediate predecessor for each stage (chain is transitive).
+          case "$TARGET" in
+            internal)   PREREQ="" ;;
+            pilot)      PREREQ="internal" ;;
+            production) PREREQ="pilot" ;;
+            *) echo "::error::Unknown target '$TARGET'"; exit 1 ;;
+          esac
+
+          if [ -z "$PREREQ" ]; then
+            echo "Target '$TARGET' has no predecessor — OK."
+            exit 0
+          fi
+
+          if [ "$ALLOW_SKIP" = "true" ]; then
+            if [ -z "${REASON// }" ]; then
+              echo "::error::allow_skip is set but 'reason' is empty — a justification is required."
+              exit 1
+            fi
+            echo "::warning::Skipping prerequisite '$PREREQ' for build $BUILD_ID — by $ACTOR — reason: $REASON"
+            echo "Override accepted; mandatory tests will still run in promote."
+            exit 0
+          fi
+
+          MARKER="promoted-${PREREQ}.json"
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$MARKER"; then
+            echo "Prerequisite satisfied: '$PREREQ' completed for build $BUILD_ID ($MARKER present)."
+          else
+            echo "::error::Build $BUILD_ID has not completed '$PREREQ'. Promote to '$PREREQ' first, or re-run with allow_skip=true + a reason."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # promote — gated by the target stage; runs mandatory tests, deploys, then
+  # records the per-stage marker on the build's Release.
+  # ---------------------------------------------------------------------------
+  promote:
+    name: Promote ${{ inputs.build_id }} → ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    needs: preflight
+    environment: ${{ inputs.target }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_ID: ${{ inputs.build_id }}
+      TARGET: ${{ inputs.target }}
+      ALLOW_SKIP: ${{ inputs.allow_skip }}
+      REASON: ${{ inputs.reason }}
+      ACTOR: ${{ github.actor }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Resolve build artifacts
+        run: |
+          set -euo pipefail
+          TAG="v0.0.${BUILD_ID}"
+          echo "Resolving build artifacts from Release $TAG"
+          mkdir -p dist
+          gh release download "$TAG" --dir dist --pattern '*.apk' --pattern '*.aab'
+          echo "Artifacts:"; ls -1 dist
+
+      - name: Run mandatory tests (placeholder)
+        run: |
+          echo "Running mandatory '$TARGET' tests for build $BUILD_ID (always run, even on skip)..."
           echo "All tests passed ✅"
 
       - name: Deploy (placeholder)
-        env:
-          TARGET: ${{ inputs.target }}
-          BUILD_ID: ${{ inputs.build_id }}
         run: |
           echo "Deploying build $BUILD_ID to '$TARGET' 👋 (placeholder — no real target yet)"
+
+      - name: Record promotion marker
+        run: |
+          set -euo pipefail
+          TAG="v0.0.${BUILD_ID}"
+          MARKER="promoted-${TARGET}.json"
+          jq -n \
+            --arg stage "$TARGET" \
+            --arg build_id "$BUILD_ID" \
+            --arg tag "$TAG" \
+            --arg approved_by "$ACTOR" \
+            --argjson skipped_prerequisite "$ALLOW_SKIP" \
+            --arg reason "$REASON" \
+            --arg run_id "$RUN_ID" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{stage:$stage, build_id:$build_id, tag:$tag, approved_by:$approved_by, skipped_prerequisite:$skipped_prerequisite, reason:$reason, run_id:$run_id, timestamp:$timestamp}' \
+            > "$MARKER"
+          echo "Recording $MARKER on $TAG:"; cat "$MARKER"
+          gh release upload "$TAG" "$MARKER" --clobber
