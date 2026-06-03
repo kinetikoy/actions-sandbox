@@ -32,6 +32,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT=$("$SCRIPT_DIR/version.sh" "$@")
 echo "$OUTPUT"
 
-# Append RELEASE_TAG derived from FULL_VERSION.
-FULL_VERSION=$(echo "$OUTPUT" | grep "^FULL_VERSION=" | cut -d= -f2)
-echo "RELEASE_TAG=v${FULL_VERSION}"
+# Append RELEASE_TAG in format v<VersionName>-<Build>[-<label>].
+# For labeled (feature branch) builds, version.sh embeds the label into
+# VERSION_NAME, producing FULL_VERSION=<base>-<label>-<build>. We reorder to
+# <base>-<build>-<label> so the build number is always the second component.
+LABEL="${3:-}"
+BUILD_NUM=$(echo "$OUTPUT" | grep "^BUILD_NUMBER=" | cut -d= -f2)
+if [ -n "$LABEL" ]; then
+  BASE_VN=$(echo "$OUTPUT" | grep "^VERSION_NAME=" | cut -d= -f2 | sed "s/-${LABEL}$//")
+  echo "RELEASE_TAG=v${BASE_VN}-${BUILD_NUM}-${LABEL}"
+else
+  FULL_VERSION=$(echo "$OUTPUT" | grep "^FULL_VERSION=" | cut -d= -f2)
+  echo "RELEASE_TAG=v${FULL_VERSION}"
+fi

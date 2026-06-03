@@ -74,6 +74,14 @@ jobs:
           fi
           echo "Resolved build $BUILD_ID → $TAG"
 
+          # Feature branch builds carry a label suffix in the tag
+          # (v26.07.1-1059-bg-1234-...). Only main and release/** builds
+          # (v26.07.1-1059) may be promoted.
+          if echo "$TAG" | grep -qE "^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-"; then
+            echo "::error::Build $BUILD_ID ($TAG) was built from a feature branch. Only main and release/** builds can be promoted."
+            exit 1
+          fi
+
           # Immediate predecessor for each stage (chain is transitive).
           case "$TARGET" in
             internal)   PREREQ="" ;;
