@@ -5,9 +5,15 @@ run-name: "Promote ${{ inputs.build_id }} → ${{ inputs.target }}${{ inputs.all
 
 # Promotes a stored build (button #2) to a later stage, enforcing order:
 #   internal → pilot → production
+#
 # Order is enforced via per-stage marker assets on the build's GitHub Release.
 # A documented override (allow_skip + reason) can bypass ORDER only — never the
 # mandatory tests. The target's environment reviewers still gate every promotion.
+#
+# Git actions triggered by promotion:
+#   pilot      → create release branch release/vYY.MM (if not already exists)
+#   production → mark the build's GitHub Release as full release (not pre-release)
+#
 # See specs/CI-DEPLOYMENT.md.
 
 on:
@@ -36,8 +42,9 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # preflight — fast ordering check, no environment/gate. Fails before any
-  # approver is involved if the predecessor stage hasn't been completed.
+  # preflight — fast ordering check, no environment/gate. Discovers the build's
+  # release tag by build number, then fails before any approver is involved if
+  # the predecessor stage hasn't been completed.
   # ---------------------------------------------------------------------------
   preflight:
     name: Preflight (ordering)
@@ -56,13 +63,16 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          TAG="v0.0.${BUILD_ID}"   # sandbox tag scheme (real ci uses full version)
 
-          # The build must actually exist as a published Release.
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::error::No release $TAG (build $BUILD_ID) found — nothing to promote."
+          # Discover the per-build release tag for this build number.
+          # RELEASE_TAG format: v<VERSION_NAME>-<BUILD_NUMBER>  e.g. v26.07.1-1059
+          TAG=$(gh release list --json tagName --jq ".[].tagName" \
+            | grep -E "^v[0-9]{2}\.[0-9]{2}\.[0-9]+-${BUILD_ID}$" | head -1 || true)
+          if [ -z "$TAG" ]; then
+            echo "::error::No release found for build $BUILD_ID — nothing to promote."
             exit 1
           fi
+          echo "Resolved build $BUILD_ID → $TAG"
 
           # Immediate predecessor for each stage (chain is transitive).
           case "$TARGET" in
@@ -96,8 +106,9 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # promote — gated by the target stage; runs mandatory tests, deploys, then
-  # records the per-stage marker on the build's Release.
+  # promote — gated by the target stage; runs mandatory tests, deploys, creates
+  # git branch/tag at the right promotion milestone, records the per-stage
+  # marker on the build's Release.
   # ---------------------------------------------------------------------------
   promote:
     name: Promote ${{ inputs.build_id }} → ${{ inputs.target }}
@@ -119,10 +130,31 @@ jobs:
       - name: Resolve build artifacts
         run: |
           set -euo pipefail
-          TAG="v0.0.${BUILD_ID}"
-          echo "Resolving build artifacts from Release $TAG"
+
+          # Discover the per-build release tag for this build number.
+          TAG=$(gh release list --json tagName --jq ".[].tagName" \
+            | grep -E "^v[0-9]{2}\.[0-9]{2}\.[0-9]+-${BUILD_ID}$" | head -1 || true)
+          if [ -z "$TAG" ]; then
+            echo "::error::No release found for build $BUILD_ID"
+            exit 1
+          fi
+
           mkdir -p dist
-          gh release download "$TAG" --dir dist --pattern '*.apk' --pattern '*.aab'
+          gh release download "$TAG" --dir dist \
+            --pattern '*.apk' --pattern '*.aab' --pattern 'build-metadata.json'
+
+          # Parse metadata and export for subsequent steps.
+          RELEASE_BRANCH=$(jq -r .release_branch dist/build-metadata.json)
+          TAG_NAME=$(jq -r .tag_name dist/build-metadata.json)
+          BUILD_SHA=$(jq -r .sha dist/build-metadata.json)
+          {
+            echo "TAG=${TAG}"
+            echo "RELEASE_BRANCH=${RELEASE_BRANCH}"
+            echo "TAG_NAME=${TAG_NAME}"
+            echo "BUILD_SHA=${BUILD_SHA}"
+          } >> "$GITHUB_ENV"
+
+          echo "Build $BUILD_ID → $TAG  version tag: $TAG_NAME  branch: $RELEASE_BRANCH  sha: ${BUILD_SHA:0:8}"
           echo "Artifacts:"; ls -1 dist
 
       - name: Run mandatory tests (placeholder)
@@ -134,10 +166,44 @@ jobs:
         run: |
           echo "Deploying build $BUILD_ID to '$TARGET' 👋 (placeholder — no real target yet)"
 
+      - name: Create release branch and version tag (pilot)
+        if: ${{ inputs.target == 'pilot' }}
+        run: |
+          set -euo pipefail
+
+          # Create release branch if it doesn't exist yet.
+          if gh api "repos/$GH_REPO/branches/$RELEASE_BRANCH" >/dev/null 2>&1; then
+            echo "Branch $RELEASE_BRANCH already exists — skipping"
+          else
+            gh api "repos/$GH_REPO/git/refs" \
+              -X POST \
+              -f "ref=refs/heads/$RELEASE_BRANCH" \
+              -f "sha=$BUILD_SHA"
+            echo "Created $RELEASE_BRANCH from ${BUILD_SHA:0:8}"
+          fi
+
+          # Create the version tag (e.g. v26.07.1) if it doesn't exist yet.
+          # This is the <RELEASE-TAG> that uniquely identifies a shipped version.
+          if gh api "repos/$GH_REPO/git/refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists — skipping"
+          else
+            gh api "repos/$GH_REPO/git/refs" \
+              -X POST \
+              -f "ref=refs/tags/$TAG_NAME" \
+              -f "sha=$BUILD_SHA"
+            echo "Created tag $TAG_NAME at ${BUILD_SHA:0:8}"
+          fi
+
+      - name: Finalize as production release
+        if: ${{ inputs.target == 'production' }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --prerelease=false --latest
+          echo "Marked $TAG as production release"
+
       - name: Record promotion marker
         run: |
           set -euo pipefail
-          TAG="v0.0.${BUILD_ID}"
           MARKER="promoted-${TARGET}.json"
           jq -n \
             --arg stage "$TARGET" \

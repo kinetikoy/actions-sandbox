@@ -35,7 +35,7 @@ env:
   ANDROID_HOME: '/opt/android-sdk'
   GRADLE_CACHE_DIR: "${{ github.workspace }}/gradle-cache"
   GRADLE_USER_HOME: "${{ github.workspace }}/.gradle"
-  BUILD_BASE_NUMBER: "170"
+  RG_BUILD_BASE: "170"
   ARTIFACT_NAME: "RestoGO"
   SCRIPTS_DIR: "./ci-scripts"
   RELEASE_NOTES_FILE: "release-notes.md"
@@ -57,35 +57,52 @@ jobs:
     runs-on: ubuntu-latest
     environment: common
     outputs:
-      build_number: ${{ steps.version.outputs.BUILD_NUMBER }}
-      version:      ${{ steps.version.outputs.VERSION }}
-      tag:          ${{ steps.version.outputs.TAG }}
+      build_number:   ${{ steps.version.outputs.BUILD_NUMBER }}
+      version_name:   ${{ steps.version.outputs.VERSION_NAME }}
+      full_version:   ${{ steps.version.outputs.FULL_VERSION }}
+      tag_name:       ${{ steps.version.outputs.TAG_NAME }}
+      release_tag:    ${{ steps.version.outputs.RELEASE_TAG }}
+      release_branch: ${{ steps.version.outputs.RELEASE_BRANCH }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # need full history for version.sh git tag lookups      
+          fetch-depth: 0
       - name: Calculate version
         id: version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA:      ${{ github.sha }}
         run: |
-          BUILD_NUMBER=$(( GITHUB_RUN_NUMBER + BUILD_BASE_NUMBER ))
-          VERSION="0.0.${BUILD_NUMBER}"   # sandbox placeholder (real ci uses VERSION_NAME)
-          TAG="v${VERSION}"
-          {
-            echo "BUILD_NUMBER=${BUILD_NUMBER}"
-            echo "VERSION=${VERSION}"
-            echo "TAG=${TAG}"
-          } >> "$GITHUB_OUTPUT"
-          echo "Build ${BUILD_NUMBER} → ${TAG}"
+          set -e
+          chmod +x "$SCRIPTS_DIR/version-gh2.sh"
+          BUILD_NUMBER=$(( GITHUB_RUN_NUMBER + RG_BUILD_BASE ))
+          REF="$GITHUB_REF_NAME"
 
-          # Surface the build number on the run page (one click from the runs list)
+          if [ "$REF" = "main" ]; then
+            "$SCRIPTS_DIR/version-gh2.sh" "next-release" "$BUILD_NUMBER" > version.env
+          elif echo "$REF" | grep -qE '^release/'; then
+            "$SCRIPTS_DIR/version-gh2.sh" "next-patch" "$BUILD_NUMBER" > version.env
+          else
+            REF_SLUG=$(echo "$REF" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
+            "$SCRIPTS_DIR/version-gh2.sh" "next-release" "$BUILD_NUMBER" "$REF_SLUG" > version.env
+          fi
+
+          cat version.env
+          while IFS='=' read -r key value; do
+            [ -n "$key" ] && echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          done < version.env
+
+          # Surface version info on the run summary page
+          . ./version.env
           {
-            echo "## 🏗️ Build ${BUILD_NUMBER}"
+            echo "## Build ${BUILD_NUMBER}"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
             echo "| Build number | \`${BUILD_NUMBER}\` |"
-            echo "| Version | \`${VERSION}\` |"
-            echo "| Release tag | \`${TAG}\` |"
+            echo "| Version | \`${VERSION_NAME}\` |"
+            echo "| Release tag | \`${RELEASE_TAG}\` |"
+            echo "| Release branch | \`${RELEASE_BRANCH}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
@@ -270,11 +287,11 @@ jobs:
     steps:
       - name: Generate placeholder variant files
         env:
-          VERSION: ${{ needs.prepare-version.outputs.version }}
+          FULL_VERSION: ${{ needs.prepare-version.outputs.full_version }}
           BUILD_NUMBER: ${{ needs.prepare-version.outputs.build_number }}
         run: |
           mkdir -p dist
-          BASE="RestoGO_${VERSION}"
+          BASE="RestoGO_${FULL_VERSION}"
           for v in dev pilot prod; do
             echo "placeholder ${v} debug apk — build ${BUILD_NUMBER}" > "dist/${BASE}-${v}-debug.apk"
           done
@@ -304,21 +321,50 @@ jobs:
         with:
           name: build-artifacts
           path: dist
+
+      - name: Generate build metadata
+        env:
+          BUILD_NUMBER:   ${{ needs.prepare-version.outputs.build_number }}
+          FULL_VERSION:   ${{ needs.prepare-version.outputs.full_version }}
+          VERSION_NAME:   ${{ needs.prepare-version.outputs.version_name }}
+          TAG_NAME:       ${{ needs.prepare-version.outputs.tag_name }}
+          RELEASE_TAG:    ${{ needs.prepare-version.outputs.release_tag }}
+          RELEASE_BRANCH: ${{ needs.prepare-version.outputs.release_branch }}
+          SHA:            ${{ github.sha }}
+          REF:            ${{ github.ref_name }}
+        run: |
+          jq -n \
+            --arg build_number   "$BUILD_NUMBER" \
+            --arg full_version   "$FULL_VERSION" \
+            --arg version_name   "$VERSION_NAME" \
+            --arg tag_name       "$TAG_NAME" \
+            --arg release_tag    "$RELEASE_TAG" \
+            --arg release_branch "$RELEASE_BRANCH" \
+            --arg sha            "$SHA" \
+            --arg ref            "$REF" \
+            --arg timestamp      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{build_number:$build_number, full_version:$full_version, version_name:$version_name, tag_name:$tag_name, release_tag:$release_tag, release_branch:$release_branch, sha:$sha, ref:$ref, timestamp:$timestamp}' \
+            > dist/build-metadata.json
+          cat dist/build-metadata.json
+
       - name: Create or update Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.prepare-version.outputs.tag }}
-          BUILD_NUMBER: ${{ needs.prepare-version.outputs.build_number }}
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:        ${{ github.repository }}
+          RELEASE_TAG:    ${{ needs.prepare-version.outputs.release_tag }}
+          BUILD_NUMBER:   ${{ needs.prepare-version.outputs.build_number }}
+          FULL_VERSION:   ${{ needs.prepare-version.outputs.full_version }}
+          REF:            ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG exists — updating assets"
-            gh release upload "$TAG" dist/* --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG exists — updating assets"
+            gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            echo "Creating per-build Release $TAG"
-            gh release create "$TAG" \
-              --title "Build $BUILD_NUMBER" \
-              --notes "Per-build artifacts for build $BUILD_NUMBER." \
+            echo "Creating pre-release $RELEASE_TAG for build $BUILD_NUMBER"
+            gh release create "$RELEASE_TAG" \
+              --title "Build $BUILD_NUMBER ($FULL_VERSION)" \
+              --notes "Build $BUILD_NUMBER from \`$REF\`. Pre-release until promoted to production." \
+              --prerelease \
               dist/*
           fi
 
